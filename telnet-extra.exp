@@ -39,22 +39,27 @@ proc telnet_close {connhost} {
     global board_info
     global errorInfo
     global spawn_id
-    
-    verbose "telnet_close: connhost $connhost" 3
+
+    verbose "telnet_close: connhost $connhost"
 
     # Close the session
     if [board_info $connhost exists fileid] {
 	set spawn_id [board_info $connhost fileid]
+
+        verbose "Sending close to '$spawn_id'"
 	if [catch {close -i $spawn_id}] {
 	    verbose "telnet_close: failed to close $spawn_id: $errorInfo"
 	}
 
+        verbose "Waiting for '$spawn_id' to finish"
 	if [catch {wait -i $spawn_id}] {
 	    verbose "telnet_close: failed to wait $spawn_id: $errorInfo"
 	}
 
 	unset board_info(${connhost},fileid)
 	unset spawn_id
+    } else {
+	verbose "telnet_close: No connection for '$connhost'"
     }
 }
 
