@@ -197,7 +197,7 @@ proc telnet_exec {boardname program args} {
     set timeout 30
 
     # Hit enter to make sure you get a shell prompt
-    if [catch {send -i $spawn_id "\r"}] {
+    if [catch {send -i $spawn_id "\n"}] {
 	verbose "telnet_exec: caught send enter to $spawn_id: $errorInfo"
 	return [list -1 "telnet to $hostname failed for $program: invalid spawn_id $spawn_id"]
     }
@@ -216,7 +216,7 @@ proc telnet_exec {boardname program args} {
 	    if {[telnet_open $connhost] != -1} {
 		set spawn_id [board_info $connhost fileid]
 		verbose "telnet_exec: new telnet session, spawn_id: $spawn_id"
-		send -i $spawn_id "\r"
+		send -i $spawn_id "\n"
 		exp_continue
 	    } else {
 		return [list -1 "telnet to $hostname failed for $program, couldn't get a shell prompt"]
@@ -226,7 +226,7 @@ proc telnet_exec {boardname program args} {
 
     # Send the command. We can't cope with any input, so only the first
     # argument (group) is sent.
-    send -i $spawn_id -- "$program $pargs\r"
+    send -i $spawn_id -- "$program $pargs\n"
 
     # We really should get the command echoed back immediately. This is a good
     # way of slurping up unexpected prompts. We first swap out any characters
@@ -283,7 +283,7 @@ proc telnet_exec {boardname program args} {
     # Check the return status. Use a short timeout for this and following
     # commands.
     set timeout 30
-    send -i $spawn_id "echo \$?\r"
+    send -i $spawn_id "echo \$?\n"
 
     # Once again, look for the "echo" reflected back as a way of slurping up
     # unexpected prompts. We don't worry about timeout here - we'll sort that
@@ -467,7 +467,7 @@ proc telnet_spawn { boardname commandline } {
     set timeout 30
 
     # Hit enter to make sure you get a shell prompt
-    send -i $spawn_id "\r"
+    send -i $spawn_id "\n"
 
     expect {
 	# A prompt indicates the current session is alive
@@ -483,7 +483,7 @@ proc telnet_spawn { boardname commandline } {
 	    if {[telnet_spawn_open $connhost] != -1} {
 		set spawn_id [board_info $connhost fileid]
 		verbose "telnet_spawn: new telnet session, spawn_id: $spawn_id"
-		send -i $spawn_id "\r"
+		send -i $spawn_id "\n"
 		exp_continue
 	    } else {
 		verbose  "telnet_spawn: Failed to recreate a new session.";
@@ -502,9 +502,9 @@ proc telnet_spawn { boardname commandline } {
     # something completes *too* quickly, so we'll put a little sleep in as
     # well.
 
-    send -i $spawn_id -- "${commandline}\r"
-    send -i $spawn_id -- "sleep 5\r"
-    send -i $spawn_id -- "exit\r"
+    send -i $spawn_id -- "${commandline}\n"
+    send -i $spawn_id -- "sleep 5\n"
+    send -i $spawn_id -- "exit\n"
 
     # Restore the old spawn ID, since we want that to remain the current
     # process.
