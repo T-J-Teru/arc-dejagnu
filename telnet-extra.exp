@@ -176,6 +176,8 @@ proc telnet_exec {boardname program args} {
 	set shell_prompt "\[^\r\n\]*\[$#\] "
     }
 
+    verbose "telnet_exec: shell prompt is ${shell_prompt}"
+
     # Start a new telnet session if one doesn't already exist. If sucessful
     # the fileid field associated with $connhost will be set to the spawn_id
     # of the new telnet process.
