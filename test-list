@@ -16,7 +16,6 @@ gcc.misc-tests:arm-isr.exp
 gcc.misc-tests:gcov.exp
 gcc.misc-tests:help.exp
 gcc.misc-tests:sieve.exp
-gcc.misc-tests:i386-prefetch.exp
 gcc.misc-tests:mg.exp
 gcc.misc-tests:dectest.exp
 gcc.misc-tests:options.exp

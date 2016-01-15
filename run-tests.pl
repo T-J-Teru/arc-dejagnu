@@ -113,6 +113,17 @@ $| = 1;
 
 my %sigchld_actions = ();
 $SIG{CHLD} = \&handle_sigchld;
+$SIG{INT} = sub { exit (1); };
+
+my %AT_EXIT = ( -function => undef, -data => undef );
+END {
+  print "[$$] END block\n";
+  my $func = $AT_EXIT { -function };
+  if (defined ($func))
+  {
+    $func->( $AT_EXIT { -data } );
+  }
+}
 
 #========================================================================#
 
@@ -124,6 +135,7 @@ my $MAX_WAIT_COUNT = 18;
 
 my $command_id = 0;
 my $ip_counter = 0;
+my $original_script_pid = $$;
 
 #========================================================================#
 
@@ -154,6 +166,17 @@ if ($give_help)
   exit (0);
 }
 
+(defined $results_dir) and (-d $results_dir) or
+  usage ("The results directory does not exist.");
+(defined $gcc_build_dir) and (-d $gcc_build_dir) or
+  usage ("The GCC build directory does not exist.");
+(defined $ezdk_dir) and (-d $ezdk_dir) or
+  usage ("The EZdk directory does not exist.");
+(defined $sim_log_dir) and (-d $sim_log_dir) or
+  usage ("The simulator log directory does not exist.");
+(defined $test_list_file) and (-f $test_list_file) and (-r $test_list_file) or
+  usage ("The test list file must be a readable text file.");
+
 #========================================================================#
 
 delete $ENV {EZTESTER_NSIM_TARGET_IP};
@@ -167,16 +190,8 @@ exists $ENV {DEJAGNU} or
 
 #========================================================================#
 
-(defined $results_dir) and (-d $results_dir) or
-  usage ("The results directory does not exist.");
-(defined $gcc_build_dir) and (-d $gcc_build_dir) or
-  usage ("The GCC build directory does not exist.");
-(defined $ezdk_dir) and (-d $ezdk_dir) or
-  usage ("The EZdk directory does not exist.");
-(defined $sim_log_dir) and (-d $sim_log_dir) or
-  usage ("The simulator log directory does not exist.");
-(defined $test_list_file) and (-f $test_list_file) and (-r $test_list_file) or
-  usage ("The test list file must be a readable text file.");
+$AT_EXIT { -function } = \&do_exit_cleanup;
+$AT_EXIT { -data } = undef;
 
 my $gcc_site_exp_config_file
   = find_gcc_site_exp_config_file ($gcc_build_dir);
@@ -245,14 +260,7 @@ while (true)
 }
 
 print "[$$] all testing complete.\n";
-foreach my $s (@all_sims)
-{
-  if (sim_is_active ($s))
-  {
-    sim_exit ($s);
-  }
-}
-
+exit_all_sims ();
 exit (0);
 
 #========================================================================#
@@ -271,9 +279,172 @@ The following methods are defined in this script.
 
 =pod
 
+=item B<wait_for_all_child_processes>
+
+Wait for all child processes to exit.  This function should only be
+called in the original script process, not in any of the child
+processes.
+
+The waiting is done by waiting for the %SIGCHLD_ACTIONS hash to become
+empty.  As each SIGCHLD is delivered, the corresponding entry in this
+hash is removed, this then is a good indication that all the child
+processes have exited.
+
+We only wait for a limited period of time, before issuing a warning,
+and returning from this function.
+
+=cut
+
+sub wait_for_all_child_processes {
+  assert (in_original_script_process ());
+
+  my $start = time ();
+  while ((time () - $start < $KILL_WAIT_TIME)
+           and (scalar (keys (%sigchld_actions)) > 0))
+  {
+    small_delay ();
+  }
+
+  if (scalar (keys (%sigchld_actions)) > 0)
+  {
+    carp ("Child processes ". join (", ", keys (%sigchld_actions))
+            ." did not exit");
+  }
+}
+
+#========================================================================#
+
+=pod
+
+=item B<exit_all_sims>
+
+Send the EXIT command to all active simulators.  This will cause the
+simulator to terminate itself.  We then wait for a limited period of
+time to give the simulators a chance to exit.
+
+=cut
+
+sub exit_all_sims {
+  print "[$$] exiting all active simulators\n";
+  foreach my $s (@all_sims)
+  {
+    if (sim_is_active ($s))
+    {
+      sim_exit ($s);
+    }
+  }
+
+  my $start = time ();
+  while (time () - $start < $KILL_WAIT_TIME)
+  {
+    my $active_count = 0;
+    foreach my $s (@all_sims)
+    {
+      if (sim_is_active ($s))
+      {
+        $active_count++;
+      }
+    }
+
+    last if ($active_count == 0);
+    small_delay ();
+  }
+}
+
+#========================================================================#
+
+=pod
+
+=item B<do_exit_cleanup>
+
+Perform cleanup before the script exits.  This function is called from
+an END block, and so is run if the script terminates in an unexpected
+manor (through die) or when the script exits normally.
+
+We send the EXIT command to all simulators, which should cause them to
+exit, we then wait for all our child processes to exit.  Any running
+tests should spot that the simulators have died and terminate
+themselves.
+
+In theory this should only ever be called from the original parent
+script process, however, we are currently not blocking signals
+sufficiently during all of the fork and exec regions, and so,
+sometimes, this might be called from a child process.  We just ignore
+such calls and return.
+
+=cut
+
+sub do_exit_cleanup {
+  return unless (in_original_script_process ());
+
+  print "[$$] exit cleanup\n";
+
+  exit_all_sims ();
+  wait_for_all_child_processes ();
+}
+
+#========================================================================#
+
+=pod
+
+=item B<read_ip_from_file>
+
+Take a simulator control descriptor hash, and read the 'net.info'
+file, which is created within the log directory.  From the 'net.info'
+file extract, and return the simulator IP address as a string.
+
+Return undef if the 'net.info' file does not exist, or the IP address
+can't be extracted for any reason.
+
+=cut
+
+sub read_ip_from_file {
+  my $simulator_status = shift;
+
+  my $log_dir = $simulator_status->{ -log_directory };
+  my $filename = $log_dir."/net.info";
+
+  return undef unless (-r $filename);
+  open my $in, $filename or return undef;
+  my $ip = undef;
+  while (<$in>)
+  {
+    if (m/^interface .* ip (\d+\.\d+\.\d+\.\d+)\s*$/)
+    {
+      $ip = $1;
+      last;
+    }
+  }
+  close $in or return undef;
+
+  return $ip;
+}
+
+#========================================================================#
+
+=pod
+
+=item B<in_original_script_process>
+
+Return true if we are in the original script process, othrwise, return
+false; this will be when we are in a sub-process of the original
+script process.
+
+=cut
+
+sub in_original_script_process {
+  return ($$ == $original_script_pid);
+}
+
+#========================================================================#
+
+=pod
+
 =item B<usage>
 
-Currently undocumented.
+Wrapper around I<pod2usage>.  Takes a message string as a single
+parameter, this is passed on to I<pod2usage> along with a specifc set
+of parameters to display the help text out of the scripts pod.
 
 =cut
 
@@ -291,13 +462,25 @@ sub usage {
 
 =item B<do_ping>
 
-Currently undocumented.
+Take two parameters, a Net::Ping object, and an ip address, or host
+name to ping as a string.  Ping the ip or host, and return true if the
+ping is a success, otherwise, return false.
+
+This wrapper blocks SIGCHLD around the call to ping, as the singal can
+interrupt the ping, which will cause the ping to appear to fail, when
+it really shouldn't.
+
+If the second argument, the IP address, is undefined, then we return
+false.
 
 =cut
 
 sub do_ping {
   my $pinger = shift;
   my $ip = shift;
+
+  assert ($pinger->isa ("Net::Ping"));
+  return false unless (defined $ip);
 
   my $sigset = POSIX::SigSet->new(SIGCHLD);
   my $old_sigset = POSIX::SigSet->new;
@@ -331,6 +514,7 @@ any more and just returns an error, these are 172.16.0.2 to
 =cut
 
 sub get_next_ip_address {
+  assert (in_original_script_process ());
   ($ip_counter < 256) or
     croak ("No more available IP addresses");
   my $ip = sprintf "172.16.%d.2", $ip_counter;
@@ -344,7 +528,11 @@ sub get_next_ip_address {
 
 =item B<sim_send_command>
 
-Currently undocumented.
+Take a simulator descriptor hash, and a command string.  Send the
+command string to the specified simulator.  Wait for a response, and
+return the response.
+
+Return undef if no response is received.
 
 =cut
 
@@ -421,7 +609,16 @@ sub sim_send_command {
 
 =item B<sim_send_reply>
 
-Currently undocumented.
+Use from the simulator control process to send a reply back to the
+main script process.  Takes simulator descriptor hash, the reply ID
+number, and the reply string.
+
+Send the reply string back to the parent process, with the reply id
+prefixed on the front.
+
+The reply id will have been extracted from the incoming command
+string, the main parent process will only accept replies with the
+correct reply id number.
 
 =cut
 
@@ -444,17 +641,17 @@ sub sim_send_reply {
 
 =item B<sim_restart>
 
-Currently undocumented.
+Take a simulator descriptor hash, send the "RESTART" command to the
+simulator, and wait for an "OK" reply.
+
+Any other reply will result in an error.
 
 =cut
 
 sub sim_restart {
   my $sim = shift;
 
-  # Delete the cached IP, so we refetch it next time.
-  delete ($sim->{ -ip });
-
-  print "[$$] sending restart command to simulator ".sim_id ($sim) ."\n";
+  print "[$$] sending RESTART command to simulator ".sim_id ($sim) ."\n";
   my $response = sim_send_command ($sim, "RESTART");
   (defined ($response)) or
     croak ("Got no response to restart request on simulator ".
@@ -490,7 +687,6 @@ sub sim_activate {
 
   assert (not (sim_is_active ($sim)));
   $sim->{ -active } = true;
-  delete ($sim->{ -ip });
 
   print "[$$] activate simulator ". sim_id ($sim) ."\n";
 
@@ -519,7 +715,7 @@ sub sim_activate {
 
     $cc->wait_for_parent ();
 
-    do_run_simulator ($sim);
+    setup_simulator_ctrl ($sim);
 
     croak ("reached unexpected point in sim_activate");
   }
@@ -534,21 +730,20 @@ sub sim_activate {
   # process crashes.
   print "[$$] process $pid created to control simulator ".
     sim_id ($sim) ."\n";
-  $sigchld_actions {$pid} = { -callback => \&run_sim_sigchld_callback,
+  $sigchld_actions {$pid} = { -callback => \&sim_ctrl_sigchld_callback,
                               -data => $sim };
   $cc->start_child ();
 
-  # The simulator is now running in the child process (or will be very
-  # soon), and we have set of file handles that will allow
-  # communication between this process and the process controlling the
-  # simulator.
+  # The simulator control process is now in place.  We have not yet
+  # started an actual simulator, this is done by sending a RESTART
+  # command to the control process, this is done later.
 }
 
 #========================================================================#
 
 =pod
 
-=item B<do_run_simulator>
+=item B<setup_simulator_ctrl>
 
 Helper function to sim_activate, takes a simulator descriptor hash.  This
 function is only ever called in a sub-process of the main script, and so
@@ -576,14 +771,21 @@ Send either "OK" or "DEAD" response.
 
 Restart the simulator sub-process.  Kill off the original simulator.
 
+=item I<IP?>
+
+Return the IP addres with witch to attach to this simulator.
+
 =back
 
 =cut
 
-sub do_run_simulator {
+sub setup_simulator_ctrl {
   my $sim = shift;
 
-  my $simulator_status = exec_simulator_process ($sim);
+  my $simulator_status = { -alive => false };
+
+  $AT_EXIT { -function } = \&kill_exec_process;
+  $AT_EXIT { -data } = $simulator_status;
 
   my $pinger = Net::Ping->new ('tcp', 2);
   my $sel = IO::Select->new ($sim->{ -read_ctrl_fh });
@@ -620,6 +822,7 @@ sub do_run_simulator {
 
       if ($command eq "EXIT")
       {
+        print "[$$] exiting simulator ". sim_id ($sim) ."\n";
         kill_exec_process ($simulator_status);
         sim_send_reply ($sim, $reply_id, "OK");
         exit (0);
@@ -631,9 +834,8 @@ sub do_run_simulator {
         if ($simulator_status->{ -alive })
         {
           my $simulator_is_gone = false;
-          my $ip = $simulator_status->{ -ip };
+          my $ip = read_ip_from_file ($simulator_status);
 
-          print "[$$] sending ping to ip $ip\n";
           if (not (do_ping ($pinger, $ip)))
           {
             if (not ($simulator_status->{ -seen_first_ping }))
@@ -644,6 +846,10 @@ sub do_run_simulator {
               {
                 sim_send_reply ($sim, $reply_id, "WAIT");
                 sleep (2);
+                if (not (defined ($ip)))
+                {
+                  $ip = read_ip_from_file ($simulator_status);
+                }
                 last if (do_ping ($pinger, $ip));
               }
             }
@@ -657,6 +863,7 @@ sub do_run_simulator {
           if ((not $simulator_is_gone)
                 and $simulator_status->{ -alive })
           {
+            assert (defined ($ip));
             $simulator_status->{ -seen_first_ping } = true;
           }
 
@@ -680,10 +887,9 @@ sub do_run_simulator {
       elsif ($command eq "RESTART")
       {
         kill_exec_process ($simulator_status);
-        $simulator_status = exec_simulator_process ($sim);
+        exec_simulator_process ($sim, $simulator_status);
 
-        my $ip = $simulator_status->{ -ip };
-        print "[$$] sending ping to ip $ip\n";
+        my $ip = read_ip_from_file ($simulator_status);
         if (not (do_ping ($pinger, $ip)))
         {
           if (not ($simulator_status->{ -seen_first_ping }))
@@ -694,6 +900,10 @@ sub do_run_simulator {
             {
               sim_send_reply ($sim, $reply_id, "WAIT");
               sleep (2);
+              if (not (defined ($ip)))
+              {
+                $ip = read_ip_from_file ($simulator_status);
+              }
               last if (do_ping ($pinger, $ip));
             }
           }
@@ -716,7 +926,15 @@ sub do_run_simulator {
       }
       elsif ($command eq "IP?")
       {
-        sim_send_reply ($sim, $reply_id, $simulator_status->{ -ip });
+        my $ip = read_ip_from_file ($simulator_status);
+        if (defined ($ip))
+        {
+          sim_send_reply ($sim, $reply_id, $ip);
+        }
+        else
+        {
+          sim_send_reply ($sim, $reply_id, "FAILED");
+        }
       }
     }
 
@@ -724,7 +942,7 @@ sub do_run_simulator {
     # can change the status to mark this instance as dead.
   }
 
-  croak ("reached unexpected point in do_run_simulator");
+  croak ("reached unexpected point in setup_simulator_ctrl");
 }
 
 
@@ -740,11 +958,12 @@ Currently undocumented.
 
 sub exec_simulator_process {
   my $sim = shift;
+  my $simulator_status = shift;
+
   assert (defined ($sim) and (ref ($sim) eq 'HASH'));
+  assert (defined ($simulator_status) and (ref ($simulator_status) eq 'HASH'));
+  assert (not ($simulator_status->{ -alive }));
 
-  my $cc = ChildControl->new ();
-
-  my $ip = get_next_ip_address ();
   my $log_dir = abs_path ($sim_log_dir."/". sim_id ($sim) .".".
                             strftime ("%Y%m%d%H%M%S", localtime ()));
   mkdir $log_dir or
@@ -754,6 +973,8 @@ sub exec_simulator_process {
   mkdir $log_dir."/logs" or
     croak ("Failed to create '${log_dir}/logs': $!");
 
+  my $cc = ChildControl->new ();
+
   my $pid = fork ();
   (defined $pid) or croak ("Failed to fork: $!");
 
@@ -761,18 +982,16 @@ sub exec_simulator_process {
   {
     $cc->wait_for_parent ();
 
-    setpgrp(0, 0) or croak ("Unable to set process group: $!");
+    setpgrp (0, 0) or croak ("Unable to set process group: $!");
 
     chdir ($ezdk_dir) or croak ("Failed to chdir '$ezdk_dir': $!");
-
-    $ip =~ s/\.\d+$/\.0/;
 
     my @args = ("${ezdk_dir}/tools/EZsim/bin/EZsim_linux_x86_64",
                 "-possible_cpus", "0-4095",
                 "-present_cpus", "0-1,16-17",
                 "-flash_image", "${ezdk_dir}/ldk/images/sim/flash.img",
                 "-net_if_connect", "true",
-                "-net_if_create_cmd", "${ezdk_dir}/tools/EZtap/bin/EZtap_linux_x86_64 -ip $ip -mask 255.255.255.0 -log_file ${log_dir}/net.info",
+                "-net_if_create_cmd", "${ezdk_dir}/tools/EZtap/bin/EZtap_linux_x86_64 -ip 172.16.0.0 -mask 255.255.255.0 -log_file ${log_dir}/net.info",
                 "-output", "${log_dir}/logs",
                 "-memory_out", "${log_dir}/memory",
                 "-log_mask", "0x0003");
@@ -783,13 +1002,11 @@ sub exec_simulator_process {
   }
 
   # First, arrange to be notified if the simulator dies.
-  my $simulator_status = { -alive => true,
-                           -pid => $pid,
-                           -start_time => time (),
-                           -seen_first_ping => false,
-                           -ip => $ip,
-                           -log_directory => $log_dir,
-                         };
+  $simulator_status->{ -alive } = true;
+  $simulator_status->{ -pid } = $pid;
+  $simulator_status->{ -start_time } = time ();
+  $simulator_status->{ -seen_first_ping } = false;
+  $simulator_status->{ -log_directory } = $log_dir;
   $sigchld_actions {$pid} = { -callback => \&exec_process_sigchld_callback,
                               -data => $simulator_status };
   print "[$$] started process $pid to exec simulator ". sim_id ($sim) ."\n";
@@ -844,6 +1061,7 @@ sub kill_exec_process {
   {
     usleep (100000); # 0.1 seconds
     return if (not ($status->{ -alive }));
+    return if (kill (0, $pid) == 0);
   }
 
   kill '-KILL', $pid or
@@ -853,9 +1071,13 @@ sub kill_exec_process {
   {
     usleep (100000); # 0.1 seconds
     return if (not ($status->{ -alive }));
+    return if (kill (0, $pid) == 0);
   }
 
-  print "[$$] unable to kill process $pid\n";
+  if (kill (0, $pid) > 0)
+  {
+    print "[$$] unable to kill process $pid\n";
+  }
   delete $sigchld_actions {$pid} if (exists $sigchld_actions {$pid});
   $status->{ -alive } = false;
 }
@@ -961,7 +1183,10 @@ sub sim_is_available {
 
 =item B<create_all_sims>
 
-Currently undocumented.
+Take a single integer argument, create that many simulators, and
+activate them all by calling I<sim_activate>.
+
+Return a list of all the simulator descriptor hashes.
 
 =cut
 
@@ -976,6 +1201,7 @@ sub create_all_sims {
                 -id => "SIM_".$i,
               };
     push @sims, $sim;
+    sim_activate ($sim);
   }
 
   return @sims;
@@ -995,6 +1221,7 @@ the simulator.
 sub sim_exit {
   my $sim = shift;
 
+  print "[$$] sending EXIT command to sim ". sim_id ($sim) ."\n";
   my $reply = sim_send_command ($sim, "EXIT");
 
   # An undefined reply indicates the simulator control process did not
@@ -1011,7 +1238,12 @@ sub sim_exit {
 
 =item B<find_available_simulator>
 
-Currently undocumented.
+From the global variable I<@all_sims> find a simulator that is
+available for running tests, or return undef if there is no available
+simulator right now.
+
+An available simulator is one that is not running any tests.  If a
+simulator is currently dead, then it is restarted.
 
 =cut
 
@@ -1022,17 +1254,16 @@ sub find_available_simulator {
   {
     next if (not (sim_is_available ($sim)));
 
-    if (not (sim_is_active ($sim)))
-    {
-      print "[$$] Need to activate simulator ".sim_id ($sim)."\n";
-      sim_activate ($sim);
-      $found_sim = $sim;
-      last;
-    }
+    # All simulators are activated at creation time.  They can only
+    # return to a non-active state if the control process dies.  Maybe
+    # we could re-activate the simulator here, however, for now we
+    # just assume that the control process never dies, and assert that
+    # the simulator is active.
+    assert (sim_is_active ($sim));
 
     if (not (sim_is_alive ($sim)))
     {
-      print "[$$] Need to restart simulator ".sim_id ($sim)."\n";
+      print "[$$] restart simulator ".sim_id ($sim)."\n";
       sim_restart ($sim);
       $found_sim = $sim;
       last;
@@ -1052,10 +1283,8 @@ sub find_available_simulator {
       print "[$$] sim ". sim_id ($found_sim) ." is not alive\n";
     }
 
-    # Calling SIM_IP causes the ip address to be cached on the
-    # simulator, which is essential.  This is not just for logging!
-    my $ip = sim_ip ($found_sim);
-    print "[$$] found an available simulator to run tests on, ip = $ip\n";
+    print "[$$] found simulator ". sim_id ($found_sim)
+      ." is available to run tests on.\n";
     sim_mark_as_unavailable ($found_sim);
   }
 
@@ -1095,14 +1324,9 @@ if you're then calling this), or the simulator itself might be dead.
 sub sim_is_alive {
   my $sim = shift;
 
-  if (exists ($sim->{ -process_died }))
+  if (not (sim_is_active ($sim)))
   {
-    assert ($sim->{ -process_died });
-    return false;
-  }
-
-  if (not ($sim->{ -active }))
-  {
+    print "[$$] simulator ". sim_id ($sim) ." is not active\n";
     return false;
   }
 
@@ -1131,15 +1355,11 @@ is the IP address with which to contact this simulator.
 sub sim_ip {
   my $sim = shift;
 
-  # Check for cached IP address.
-  return $sim->{ -ip } if (exists ($sim->{ -ip }));
-
   my $response = sim_send_command ($sim, "IP?");
   (defined $response) or return undef;
 
-  # Validate, cache, and return IP address.
+  # Validate and return IP address.
   assert ($response =~ m/^\d+\.\d+\.\d+\.\d+$/);
-  $sim->{ -ip } = $response;
   return $response;
 }
 
@@ -1149,7 +1369,10 @@ sub sim_ip {
 
 =item B<build_test_list>
 
-Currently undocumented.
+Take the name of a file containing a test list, and return an actual
+list object containing all of the tests described within the file.
+
+GLOB patterns within the test list file are expanded.
 
 =cut
 
@@ -1265,6 +1488,9 @@ sub cleanup_after_child {
   print "[$$] simulator used by child with pid $pid is ".
     ($sim_alive ? "Alive" : "Dead") ."\n";
 
+  assert (exists ($child->{ -results_directory }));
+  my $result_dir = $child->{ -results_directory };
+
   if (($child->{ -exit_code } != 0) or (not $sim_alive))
   {
     assert (exists ($child->{ -test }));
@@ -1282,7 +1508,16 @@ sub cleanup_after_child {
     {
       print "[$$] abandoning test set after too many attempts\n";
     }
+
+    open my $out, ">".$result_dir."/INVALID-RESULTS" or
+      croak ("Failed to open INVALID-RESULTS file: $!");
+    print $out "These tests have failed, results are invalid.\n";
+    close $out or
+      croak ("Failed to close INVALID-RESULTS file: $!");
   }
+
+  unlink "${result_dir}/INCOMPLETE-RESULTS" or
+    croak ("Could not remove ${result_dir}/INCOMPLETE-REMOVE file: $!");
 
   # The simulator is no longer in use, so mark it as available.
   sim_mark_as_available ($sim);
@@ -1387,21 +1622,21 @@ sub exec_process_sigchld_callback {
 
 =pod
 
-=item B<run_sim_sigchld_callback>
+=item B<sim_ctrl_sigchld_callback>
 
-Callback function that is run when one of the processes that control a
-simulator exits.  This callback takes parameters I<-pid>, I<-status>, and
-I<-data>.  The pid is the process ID of the child that exited.  The status
-is the exit status of the process, and the data is a reference to a
-simulator descriptor hash.
+Callback function that is run when one of the simulator control
+processes exits.  This callback takes parameters I<-pid>, I<-status>,
+and I<-data>.  The pid is the process ID of the child that exited.
+The status is the exit status of the process, and the data is a
+reference to a simulator descriptor hash.
 
-Currently we just mark the simulator as non-active, and leave a cookie that
-the simulator has died, then we add the simulator to the list of dead
-simulators so the main loop can process it.
+Currently we just mark the simulator as non-active, and leave a cookie
+that the simulator has died, then we add the simulator to the list of
+dead simulators so the main loop can process it.
 
 =cut
 
-sub run_sim_sigchld_callback {
+sub sim_ctrl_sigchld_callback {
   my %args = @_;
 
   my $pid = $args { -pid };
@@ -1413,10 +1648,8 @@ sub run_sim_sigchld_callback {
   my $sim = $data;
   assert (exists ($sim->{ -active }));
   assert ($sim->{ -active });
-  assert (not (exists ($sim->{ -process_died })));
 
   $sim->{ -active } = false;
-  $sim->{ -process_died } = true;
   push @dead_simulators, $sim;
 }
 
@@ -1458,7 +1691,7 @@ sub start_test {
   print "[$$] creating child process to perform tests.\n";
   my $pid = fork ();
   (defined $pid) or
-    croak ("fork () failed: $!");
+    croak ("fork failed: $!");
 
   if ($pid == 0)
   {
@@ -1476,7 +1709,8 @@ sub start_test {
 
   # Parent, create a record that the child has been created, and which
   # tests the child is planning to run.
-  my $child = { -pid => $pid, -test => $test, -sim => $sim };
+  my $child = { -pid => $pid, -test => $test, -sim => $sim,
+                -results_directory => $tempdir };
   $running_tests {$pid} = $child;
 
   # Now setup the sigchld callback data, so we know what to do when the
@@ -1513,7 +1747,12 @@ sub do_start_test {
   my $sim = shift;
   my $test = shift;
 
-  my $runtest_status = exec_runtest_process ($sim, $test);
+  my $ip = sim_ip ($sim);
+  my $runtest_status = { -alive => false };
+  exec_runtest_process ($sim, $runtest_status, $ip, $test);
+
+  $AT_EXIT { -function } = \&kill_exec_process;
+  $AT_EXIT { -data } = $runtest_status;
 
   # PARENT: Wait for the child process to finish.  Monitor the simulator to
   # see if it is still active.
@@ -1575,8 +1814,6 @@ sub do_start_test {
 
   # Looks like the tests ran, and we got some results.
   print "[$$] test results look promising.\n";
-  unlink "INCOMPLETE-RESULTS" or
-    croak ("Could not remove INCOMPLETE-REMOVE file: $!");
   exit (0);
 }
 
@@ -1592,6 +1829,8 @@ Currently undocumented.
 
 sub exec_runtest_process {
   my $sim = shift;
+  my $runtest_status = shift;
+  my $ip = shift;
   my $test = shift;
 
   my $cc = ChildControl->new ();
@@ -1600,15 +1839,15 @@ sub exec_runtest_process {
   print "[$$] creating grandchild process in which to exec runtest\n";
   my $pid = fork ();
   (defined $pid) or
-    croak ("fork () failed: $!");
+    croak ("fork failed: $!");
 
   # CHILD: Start the runtest process.
   if ($pid == 0)
   {
     $cc->wait_for_parent ();
-    setpgrp(0, 0) or croak ("Unable to set process group: $!");
+    setpgrp (0, 0) or croak ("Unable to set process group: $!");
 
-    $ENV {EZTESTER_NSIM_TARGET_IP} = sim_ip ($sim);
+    $ENV {EZTESTER_NSIM_TARGET_IP} = $ip;
 
     # In the child, this is where we should become a runtest process...
     my $exp_file = $test->{ -exp_file };
@@ -1626,7 +1865,8 @@ sub exec_runtest_process {
     croak ("[$$] failed to start runtest");
   }
 
-  my $runtest_status = { -alive => true, -pid => $pid };
+  $runtest_status->{ -alive } = true;
+  $runtest_status->{ -pid } = $pid ;
   $sigchld_actions {$pid} = { -callback => \&exec_process_sigchld_callback,
                               -data => $runtest_status };
   print "[$$] grandchild process $pid is ready to go\n";
@@ -1641,7 +1881,9 @@ sub exec_runtest_process {
 
 =item B<find_gcc_site_exp_config_file>
 
-Currently undocumented.
+Take the path to the GCC build directory.  Rebuild the site.exp file
+that is used for testing.  Return a path to this file within the build
+tree.
 
 =cut
 
@@ -1664,8 +1906,6 @@ sub find_gcc_site_exp_config_file {
   # Return the path to this file.
   return $site_exp_path;
 }
-
-#========================================================================#
 
 #========================================================================#
 
