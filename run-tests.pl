@@ -1671,7 +1671,7 @@ sub start_test {
 
   # Within the results directory, create a temporary directory in which to
   # run these tests.
-  my $tempdir = tempdir ( DIR => $results_dir );
+  my $tempdir = abs_path (tempdir ( DIR => $results_dir ));
   print "[$$] created results directory: $tempdir\n";
 
   open my $out, ">".$tempdir."/INCOMPLETE-RESULTS" or
@@ -1680,10 +1680,31 @@ sub start_test {
   close $out or
     croak ("Failed to close INCOMPLETE-RESULTS file: $!");
 
+  # Create a location within TEMPDIR to hold compiled binaries.
+  mkdir "${tempdir}/obj" or
+    croak ("Failed to create tmp directory witin ${tempdir}: $!");
+
   # Copy the site.exp file from the original build tree into the temporary
   # directory.
-  copy ($gcc_site_exp_config_file, $tempdir) or
-    croak ("Failed to copy '$gcc_site_exp_config_file' into '$tempdir'");
+  open my $site_exp_in, $gcc_site_exp_config_file or
+    croak ("Failed to open '$gcc_site_exp_config_file': $!");
+  open my $site_exp_out, ">${tempdir}/site.exp" or
+    croak ("Failed to open '${tempdir}/site.exp' for writting: $!");
+  while (<$site_exp_in>)
+  {
+    if (m/^set tmpdir /)
+    {
+      print $site_exp_out "set tmpdir ${tempdir}/obj\n";
+    }
+    else
+    {
+      print $site_exp_out $_;
+    }
+  }
+  close $site_exp_out or
+    croak ("Failed to close '${tempdir}/site.exp': $!");
+  close $site_exp_in or
+    croak ("Failed to close '$gcc_site_exp_config_file': $!");
 
   # Object to control the child process.
   my $cc = ChildControl->new ();
