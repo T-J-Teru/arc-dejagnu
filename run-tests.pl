@@ -117,7 +117,6 @@ $SIG{INT} = sub { exit (1); };
 
 my %AT_EXIT = ( -function => undef, -data => undef );
 END {
-  print "[$$] END block\n";
   my $func = $AT_EXIT { -function };
   if (defined ($func))
   {
