@@ -111,21 +111,6 @@ $| = 1;
 
 #========================================================================#
 
-my %sigchld_actions = ();
-$SIG{CHLD} = \&handle_sigchld;
-$SIG{INT} = sub { exit (1); };
-
-my %AT_EXIT = ( -function => undef, -data => undef );
-END {
-  my $func = $AT_EXIT { -function };
-  if (defined ($func))
-  {
-    $func->( $AT_EXIT { -data } );
-  }
-}
-
-#========================================================================#
-
 my $KILL_WAIT_TIME = 10;
 my $SIM_STARTUP_TIME = 180;
 my $MAX_WAIT_COUNT = 18;
@@ -189,22 +174,51 @@ exists $ENV {DEJAGNU} or
 
 #========================================================================#
 
-$AT_EXIT { -function } = \&do_exit_cleanup;
-$AT_EXIT { -data } = undef;
-
 my $gcc_site_exp_config_file
   = find_gcc_site_exp_config_file ($gcc_build_dir);
 
 # List of test descriptors.  Each entry is a hash reference.
 my @test_list = build_test_list ($test_list_file);
 
-my @dead_simulators = ();
-my @all_sims = create_all_sims ($sim_count);
+#========================================================================#
 
 # A list of all tests that have stopped, but not yet been cleaned up.  This
 # is filled in from the SIGCHLD handler.  Each entry will be a hash
 # reference with keys '-pid' and '-status'.
 my @dead_children = ();
+
+# A list of simulator control processes that have terminated.  This is
+# filled in from the SIGCHLD handler.  This is not the simulator itself
+# that has crashed, rather the control process.  This is not expected to
+# happen.
+my @dead_simulators = ();
+
+# Global list of all simulator descriptor hashes.  Each entry is a hash
+# reference, and represents a single simulator instance.
+my @all_sims = ();
+
+# Hash of SIGCHLD handlers.  The key of each entry is a process id (PID),
+# each value is a hash reference for a hash with two keys '-callback' and
+# '-data'.  The '-callback' is a function to call, and '-data' is some data
+# to pass to the callback function.
+#
+# The callback function is called with a hash of arguments, the hash keys
+# are '-pid', '-status', and '-data'.  The '-pid' is the process id that
+# caused the SIGCHLD, the '-status' is the exit status of the process, and
+# '-data' is the data argument that was registered in the %sigchld_actions
+# hash.
+my %sigchld_actions = ();
+
+# Setup the SIGCHLD and SIGINT handlers.
+$SIG{CHLD} = \&handle_sigchld;
+$SIG {INT} = \&do_exit_cleanup;
+
+#========================================================================#
+
+# Create all of the simulators.
+@all_sims = create_all_sims ($sim_count);
+
+#========================================================================#
 
 # This is a hash of all the tests that are currently running.  The key is
 # the pid of the process responsible for running the test, the data is a
@@ -273,6 +287,52 @@ The following methods are defined in this script.
 =over 4
 
 =cut
+
+#========================================================================#
+
+=pod
+
+=item B<block_signals>
+
+Take a list of signals and arrange for those signals to be blocked.
+Return a POSIX::SigSet containing the original signal set.
+
+=cut
+
+sub block_signals {
+  my @signals = @_;
+
+  my $sigset = POSIX::SigSet->new (@signals);
+  my $old_sigset = POSIX::SigSet->new ();
+
+  sigprocmask(SIG_BLOCK, $sigset, $old_sigset) or
+    croak ("Could not block signals in $sigset\n");
+
+  return $old_sigset;
+}
+
+#========================================================================#
+
+=pod
+
+=item B<unblock_signals>
+
+Take a list of signals and arrange for those signals to be unblocked.
+Return a POSIX::SigSet containing the original signal set.
+
+=cut
+
+sub unblock_signals {
+  my @signals = @_;
+
+  my $sigset = POSIX::SigSet->new (@signals);
+  my $old_sigset = POSIX::SigSet->new ();
+
+  sigprocmask(SIG_UNBLOCK, $sigset, $old_sigset) or
+    croak ("Could not block signals in $sigset\n");
+
+  return $old_sigset;
+}
 
 #========================================================================#
 
@@ -357,9 +417,8 @@ sub exit_all_sims {
 
 =item B<do_exit_cleanup>
 
-Perform cleanup before the script exits.  This function is called from
-an END block, and so is run if the script terminates in an unexpected
-manor (through die) or when the script exits normally.
+Perform cleanup before the script exits.  This function is called in the
+parent process from a SIGINT handler.
 
 We send the EXIT command to all simulators, which should cause them to
 exit, we then wait for all our child processes to exit.  Any running
@@ -482,20 +541,11 @@ sub do_ping {
   assert ($pinger->isa ("Net::Ping"));
   return false unless (defined $ip);
 
-  my $sigset = POSIX::SigSet->new(SIGCHLD);
-  my $old_sigset = POSIX::SigSet->new;
-
-  unless (defined sigprocmask(SIG_BLOCK, $sigset, $old_sigset))
-  {
-    croak ("Could not block SIGCHLD\n");
-  }
+  block_signals (SIGCHLD);
 
   my $result = $pinger->ping ($ip);
 
-  unless (defined sigprocmask(SIG_SETMASK, $old_sigset))
-  {
-    croak ("Could not unblock SIGCHLD\n");
-  }
+  unblock_signals (SIGCHLD);
 
   return $result;
 }
@@ -702,36 +752,66 @@ sub sim_activate {
 
   my $cc = ChildControl->new ();
 
+  # Don't allow SIGINT or SIGCHLD to arrive during creation of a child
+  # process, data structures are still being setup.
+  block_signals (SIGINT, SIGCHLD);
+
   my $pid = fork ();
   (defined $pid) or croak ("Failed to fork: $!");
 
   if ($pid == 0)
   {
+    # Put this child, and all its children into its own process group.
+    setpgrp (0, 0) or
+      croak ("failed to setpgrp in sim_activate: $!");
+
+    # Extract the filehandles from the IO::Pipe and store them away.  This
+    # is how we will communicate with our parent process.
     $pipe1->reader ();
     $pipe2->writer ()->autoflush ();
-
     $sim->{ -read_ctrl_fh } = $pipe1;
     $sim->{ -write_ctrl_fh } = $pipe2;
 
+    # Restore the default SIGINT behaviour (exit) and clear out the list of
+    # child processes.  We are a new generation, and so have no children.
+    $SIG {INT} = "DEFAULT";
+    %sigchld_actions = ();
+
+    # We can now safely arrange to receive SIGINT and SIGCHLD again.  We'll
+    # exit on SIGINT, and when we do create children of our own we will
+    # correctly handle their death.
+    unblock_signals (SIGINT, SIGCHLD);
+
+    # The parent will tell us when it has finished setting up its data
+    # structures.
     $cc->wait_for_parent ();
 
-    setup_simulator_ctrl ($sim);
+    # The parent is ready, we can now safely think about starting an actual
+    # instance of the simulator.
+    run_simulator ($sim);
 
     croak ("reached unexpected point in sim_activate");
   }
 
+  # Extract the filehandles from the IO::Pipe, turn on autoflush, and store
+  # the handles for later use.  These are how we talk to the simulator.
   $pipe1->writer ()->autoflush ();
   $pipe2->reader ();
-
   $sim->{ -read_ctrl_fh } = $pipe2;
   $sim->{ -write_ctrl_fh } = $pipe1;
 
-  # Create a mechanism to handle the case where the simulator control
-  # process crashes.
+  # Record an entry for this child process in the relevant data structure,
+  # this will be used when the child dies to ensure we clean up correctly.
   print "[$$] process $pid created to control simulator ".
     sim_id ($sim) ."\n";
   $sigchld_actions {$pid} = { -callback => \&sim_ctrl_sigchld_callback,
                               -data => $sim };
+
+  # We are now ready to handle the death of our child.  Open ourselves up
+  # to signals again.
+  unblock_signals (SIGINT, SIGCHLD);
+
+  # Finally, let the child continue.
   $cc->start_child ();
 
   # The simulator control process is now in place.  We have not yet
@@ -743,7 +823,7 @@ sub sim_activate {
 
 =pod
 
-=item B<setup_simulator_ctrl>
+=item B<run_simulator>
 
 Helper function to sim_activate, takes a simulator descriptor hash.  This
 function is only ever called in a sub-process of the main script, and so
@@ -779,18 +859,21 @@ Return the IP addres with witch to attach to this simulator.
 
 =cut
 
-sub setup_simulator_ctrl {
+sub run_simulator {
   my $sim = shift;
 
-  my $simulator_status = { -alive => false };
+  assert (not (in_original_script_process ()));
 
-  $AT_EXIT { -function } = \&kill_exec_process;
-  $AT_EXIT { -data } = $simulator_status;
+  my $simulator_status = { -alive => false };
 
   my $pinger = Net::Ping->new ('tcp', 2);
   my $sel = IO::Select->new ($sim->{ -read_ctrl_fh });
   while (true)
   {
+    # We either have no simulator running yet, or just a single simulator
+    # running.
+    assert (scalar (keys (%sigchld_actions)) <= 1);
+
     # Wait for incoming commands.
     my @ready = $sel->can_read (10);
 
@@ -942,7 +1025,7 @@ sub setup_simulator_ctrl {
     # can change the status to mark this instance as dead.
   }
 
-  croak ("reached unexpected point in setup_simulator_ctrl");
+  croak ("reached unexpected point in run_simulator");
 }
 
 
@@ -985,6 +1068,8 @@ sub exec_simulator_process {
     setpgrp (0, 0) or croak ("Unable to set process group: $!");
 
     chdir ($ezdk_dir) or croak ("Failed to chdir '$ezdk_dir': $!");
+
+    # TODO: Restore signal mask here.
 
     my @args = ("${ezdk_dir}/tools/EZsim/bin/EZsim_linux_x86_64",
                 "-possible_cpus", "0-4095",
@@ -1663,11 +1748,16 @@ Takes a SIM descriptor hash, and a TEST descriptor hash.  Start the test
 running in a child process.  Add an entry to the RUNNING_TESTS hash to
 record that the test is now running.
 
+This function should be called from the main parent process.  This function
+will trigger the creation of child processes to handle running the test.
+
 =cut
 
 sub start_test {
   my $sim = shift;
   my $test = shift;
+
+  assert (in_original_script_process ());
 
   # Within the results directory, create a temporary directory in which to
   # run these tests.
@@ -1709,6 +1799,10 @@ sub start_test {
   # Object to control the child process.
   my $cc = ChildControl->new ();
 
+  # Don't allow SIGINT or SIGCHLD to arrive during creation of a child
+  # process, data structures are still being setup.
+  block_signals (SIGINT, SIGCHLD);
+
   print "[$$] creating child process to perform tests.\n";
   my $pid = fork ();
   (defined $pid) or
@@ -1716,14 +1810,29 @@ sub start_test {
 
   if ($pid == 0)
   {
+    # Put this child, and all its children into its own process group.
+    setpgrp (0, 0) or
+      croak ("failed to setpgrp in start_test: $!");
+
+    # Restore the default SIGINT behaviour (exit) and clear out the list of
+    # child processes.  We are a new generation, and so have no children.
+    $SIG {INT} = "DEFAULT";
+    %sigchld_actions = ();
+
+    # We can now safely arrange to receive SIGINT and SIGCHLD again.  We'll
+    # exit on SIGINT, and when we do create children of our own we will
+    # correctly handle their death.
+    unblock_signals (SIGINT, SIGCHLD);
+
     # Child, wait for parent to tell us to start, then enter the temporary
     # directory, and start a runtest process.
     $cc->wait_for_parent ();
 
-    # Now go off and start running the tests.
+    # The parent process is ready.  We can now entry the temporary
+    # directory we created for running these tests and start them off.
     chdir $tempdir or
       croak ("Failed to enter temporary directory '$tempdir': $!");
-    do_start_test ($sim, $test);
+    run_test ($sim, $test);
 
     croak ("unexpected point in child with pid $$");
   }
@@ -1742,14 +1851,16 @@ sub start_test {
   # OK, we can now tell the child to continue.  At any point after this the
   # child might exit, but that's OK, we're setup to handle that now.
   print "[$$] child process $pid is ready to start now.\n";
+  unblock_signals (SIGINT, SIGCHLD);
   $cc->start_child ();
+
 }
 
 #========================================================================#
 
 =pod
 
-=item B<do_start_test>
+=item B<run_test>
 
 Helper function for start_test.  This is called from a child process
 created within start_test.  This function takes care of actually starting
@@ -1764,16 +1875,15 @@ was created to run the tests.
 
 =cut
 
-sub do_start_test {
+sub run_test {
   my $sim = shift;
   my $test = shift;
+
+  assert (not (in_original_script_process ()));
 
   my $ip = sim_ip ($sim);
   my $runtest_status = { -alive => false };
   exec_runtest_process ($sim, $runtest_status, $ip, $test);
-
-  $AT_EXIT { -function } = \&kill_exec_process;
-  $AT_EXIT { -data } = $runtest_status;
 
   # PARENT: Wait for the child process to finish.  Monitor the simulator to
   # see if it is still active.
@@ -1881,6 +1991,8 @@ sub exec_runtest_process {
 
     my @args = ("runtest", "--tool", "gcc",
                 "--target_board=arc-linux-nsim", $test_spec);
+
+    # Use braces to suppress warning about 'croak' after 'exec'.
     { exec @args; };
 
     croak ("[$$] failed to start runtest");
