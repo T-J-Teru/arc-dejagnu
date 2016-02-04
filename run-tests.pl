@@ -348,6 +348,7 @@ sub exit_all_sims {
     last if ($active_count == 0);
     small_delay ();
   }
+  print "[$$] all simulators have exited\n";
 }
 
 #========================================================================#
