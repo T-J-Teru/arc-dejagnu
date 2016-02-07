@@ -43,7 +43,7 @@ gcc.dg:debug.exp
 gcc.dg:ipa.exp=gcc.dg/ipa/*.c
 gcc.dg:fixed-point.exp
 gcc.dg:charset.exp
-gcc.dg:dg-torture.exp
+gcc.dg:dg-torture.exp=gcc.dg/torture/*.c
 gcc.dg:stackalign.exp
 gcc.dg:tls.exp
 gcc.dg:graphite.exp
