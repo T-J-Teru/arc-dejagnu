@@ -1086,7 +1086,15 @@ sub exec_simulator_process {
     croak ("reached unexpected point in simulator");
   }
 
-  # First, arrange to be notified if the simulator dies.
+  # Clear the status array using delete rather than assigning an empty
+  # array as the status hash reference was passed in by value, so
+  # assigning an empty hash here would simply create a new value for
+  # the reference, the original value will still be valid in the
+  # caller.
+  delete @{$simulator_status}{keys %$simulator_status};
+
+  # Now setup the status hash, and register it with the SIGCHLD action
+  # array so we can know if the simulator exits.
   $simulator_status->{ -alive } = true;
   $simulator_status->{ -pid } = $pid;
   $simulator_status->{ -start_time } = time ();
@@ -1134,6 +1142,7 @@ sub kill_exec_process {
 
   # Is this process still around?
   return if (not ($status->{ -alive }));
+  assert (not (exists ($status->{ -status })));
   my $pid = $status->{ -pid };
 
   kill '-INT', $pid or
@@ -1159,12 +1168,16 @@ sub kill_exec_process {
     return if (kill (0, $pid) == 0);
   }
 
+  # This process seems to be unkillable.  Just ignore it for now and
+  # let it become a zombie, We mark it as dead and fake an exit
+  # status.
   if (kill (0, $pid) > 0)
   {
     print "[$$] unable to kill process $pid\n";
   }
   delete $sigchld_actions {$pid} if (exists $sigchld_actions {$pid});
   $status->{ -alive } = false;
+  $status->{ -status } = 1;   # Fake, non-zero exit status.
 }
 
 #========================================================================#
@@ -1998,6 +2011,15 @@ sub exec_runtest_process {
     croak ("[$$] failed to start runtest");
   }
 
+  # Clear the status array using delete rather than assigning an empty
+  # array as the status hash reference was passed in by value, so
+  # assigning an empty hash here would simply create a new value for
+  # the reference, the original value will still be valid in the
+  # caller.
+  delete @{$runtest_status}{keys %$runtest_status};
+
+  # Now setup the status array to allow us to track whether the
+  # runtest process is still alive.
   $runtest_status->{ -alive } = true;
   $runtest_status->{ -pid } = $pid ;
   $sigchld_actions {$pid} = { -callback => \&exec_process_sigchld_callback,
