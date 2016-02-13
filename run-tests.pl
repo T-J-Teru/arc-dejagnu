@@ -1894,9 +1894,8 @@ sub run_test {
 
   assert (not (in_original_script_process ()));
 
-  my $ip = sim_ip ($sim);
   my $runtest_status = { -alive => false };
-  exec_runtest_process ($sim, $runtest_status, $ip, $test);
+  exec_runtest_process ($sim, $runtest_status, $test);
 
   # PARENT: Wait for the child process to finish.  Monitor the simulator to
   # see if it is still active.
@@ -1967,16 +1966,26 @@ sub run_test {
 
 =item B<exec_runtest_process>
 
-Currently undocumented.
+This is called for a child process of the original process, and has
+the task of creating yet another child process, and then exec-ing,
+within that child, the 'runtest' process.
+
+The arguments to this function are the simulator descriptor hash, the
+exec-status hash, and the test description hash.
+
+When this function is called the process will already be within the
+temporary directory where the results of the runtest should be stored.
 
 =cut
 
 sub exec_runtest_process {
   my $sim = shift;
   my $runtest_status = shift;
-  my $ip = shift;
   my $test = shift;
 
+  assert (not (in_original_script_process ()));
+
+  my $ip = sim_ip ($sim);
   my $cc = ChildControl->new ();
 
   # Create a child process.
@@ -2004,6 +2013,12 @@ sub exec_runtest_process {
 
     my @args = ("runtest", "--tool", "gcc",
                 "--target_board=arc-linux-nsim", $test_spec);
+
+    # Redirect stdout and stderr as the last thing before we exec runtest.
+    open STDOUT, ">runtest.output" or
+      croak ("Failed to re-open stdout to file 'runtest.output': $!");
+    open STDERR, ">&", \*STDOUT or
+      croak ("Failed to re-open stderr to stdout: $!");
 
     # Use braces to suppress warning about 'croak' after 'exec'.
     { exec @args; };
