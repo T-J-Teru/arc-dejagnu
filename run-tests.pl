@@ -1035,7 +1035,11 @@ sub run_simulator {
 
 =item B<exec_simulator_process>
 
-Currently undocumented.
+Called in a sub-process of the top level run-tests process, this
+function create another child, and in that child, exec's a simulator.
+
+The parameters are a simulator descriptor hash, and a exec-process
+descriptor hash for the simulator.
 
 =cut
 
@@ -1043,6 +1047,7 @@ sub exec_simulator_process {
   my $sim = shift;
   my $simulator_status = shift;
 
+  assert (not (in_original_script_process ()));
   assert (defined ($sim) and (ref ($sim) eq 'HASH'));
   assert (defined ($simulator_status) and (ref ($simulator_status) eq 'HASH'));
   assert (not ($simulator_status->{ -alive }));
@@ -1056,8 +1061,11 @@ sub exec_simulator_process {
   mkdir $log_dir."/logs" or
     croak ("Failed to create '${log_dir}/logs': $!");
 
-  my $cc = ChildControl->new ();
+  # Don't allow SIGINT or SIGCHLD to arrive during creation of a child
+  # process, data structures are still being setup.
+  block_signals (SIGINT, SIGCHLD);
 
+  my $cc = ChildControl->new ();
   my $pid = fork ();
   (defined $pid) or croak ("Failed to fork: $!");
 
@@ -1065,11 +1073,16 @@ sub exec_simulator_process {
   {
     $cc->wait_for_parent ();
 
-    setpgrp (0, 0) or croak ("Unable to set process group: $!");
+    # Place the simulator into its own process group.
+    setpgrp (0, 0) or
+      croak ("Unable to set process group: $!");
 
-    chdir ($ezdk_dir) or croak ("Failed to chdir '$ezdk_dir': $!");
+    # Move into the simulator logging directory.
+    chdir ($ezdk_dir) or
+      croak ("Failed to chdir '$ezdk_dir': $!");
 
-    # TODO: Restore signal mask here.
+    # Unblock SIGINT and SIGCHLD before starting the simulator.
+    unblock_signals (SIGINT, SIGCHLD);
 
     my @args = ("${ezdk_dir}/tools/EZsim/bin/EZsim_linux_x86_64",
                 "-possible_cpus", "0-4095",
@@ -1081,6 +1094,14 @@ sub exec_simulator_process {
                 "-memory_out", "${log_dir}/memory",
                 "-log_mask", "0x0003");
     print "[$$] exec: ". join (" ", @args). "\n";
+
+    # Last thing before starting the simulator, redirect any stdout
+    # and stderr into a file for logging.
+    open STDOUT, ">sim.output" or
+      croak ("Failed to re-open stdout to file 'sim.output': $!");
+    open STDERR, ">&", \*STDOUT or
+      croak ("Failed to re-open stderr to stdout: $!");
+
     { exec @args; };
 
     croak ("reached unexpected point in simulator");
@@ -1104,6 +1125,10 @@ sub exec_simulator_process {
                               -data => $simulator_status };
   print "[$$] started process $pid to exec simulator ". sim_id ($sim) ."\n";
   $cc->start_child ();
+
+  # We are now ready to handle the death of our child.  Open ourselves up
+  # to signals again.
+  unblock_signals (SIGINT, SIGCHLD);
 
   return $simulator_status;
 }
