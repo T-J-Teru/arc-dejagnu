@@ -169,8 +169,8 @@ exists $ENV {LM_LICENSE_FILE} or
 exists $ENV {DEJAGNU} or
   croak ("Missing DEJAGNU environment variable");
 
-(system ("arceb-ezchip-linux-uclibc-gcc --version >/dev/null 2>&1") == 0) or
-  croak ("Could not  arceb-ezchip-linux-uclibc-gcc in PATH");
+(system ("arceb-mellanox-linux-uclibc-gcc --version >/dev/null 2>&1") == 0) or
+  croak ("Could not  arceb-mellanox-linux-uclibc-gcc in PATH");
 
 #========================================================================#
 
